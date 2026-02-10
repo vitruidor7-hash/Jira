@@ -84,9 +84,9 @@ type Issue = {
   status: IssueStatus;
   priority: IssuePriority;
   assignee_id?: string | null;
-  assignee_name?: string | null;
   reporter_id?: string | null;
-  reporter_name?: string | null;
+  assignee?: ProfileLite | null;
+  reporter?: ProfileLite | null;
   story_points?: number | null;
   due_date?: string | null;
   position: number;
@@ -99,7 +99,7 @@ type Comment = {
   project_id: string;
   issue_id: string;
   author_id: string;
-  author_name: string;
+  author?: ProfileLite | null;
   body: string;
   created_at: string;
 };
@@ -108,7 +108,7 @@ type Activity = {
   id: string;
   project_id: string;
   actor_id: string;
-  actor_name: string;
+  actor?: ProfileLite | null;
   action: string;
   metadata?: Record<string, unknown>;
   created_at: string;
@@ -118,6 +118,18 @@ type Filters = {
   q: string;
   priority: "all" | IssuePriority;
   assignee: "all" | string;
+};
+
+type ProfileLite = {
+  id: string;
+  display_name: string | null;
+};
+
+type ProjectMember = {
+  project_id: string;
+  user_id: string;
+  role: string;
+  profiles?: ProfileLite | null;
 };
 
 type LockPayload = {
@@ -193,6 +205,12 @@ function resolveDisplayName(user: User): string {
   return "User";
 }
 
+function resolveProfileName(profile: ProfileLite | null | undefined, fallback?: string | null) {
+  if (profile?.display_name?.trim()) return profile.display_name.trim();
+  if (fallback?.trim()) return fallback.trim();
+  return "User";
+}
+
 function getNextIssueKey(existingIssues: Issue[], projectPrefix = "ALPHA") {
   let maxId = 0;
   for (const i of existingIssues) {
@@ -225,10 +243,11 @@ type SortableIssueCardProps = {
   issue: Issue;
   lockInfo?: LockInfo;
   me: UserLite;
+  memberDirectory: Record<string, string>;
   onSelect: (issue: Issue) => void;
 };
 
-function SortableIssueCard({ issue, lockInfo, me, onSelect }: SortableIssueCardProps) {
+function SortableIssueCard({ issue, lockInfo, me, memberDirectory, onSelect }: SortableIssueCardProps) {
   const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({
     id: toIssueDragId(issue.id),
   });
@@ -259,7 +278,7 @@ function SortableIssueCard({ issue, lockInfo, me, onSelect }: SortableIssueCardP
 
           <div className="flex items-center justify-between gap-2">
             <div className="text-xs text-muted-foreground truncate">
-              {issue.assignee_name || "Unassigned"}
+              {issue.assignee_id ? memberDirectory[issue.assignee_id] || "Unknown user" : "Unassigned"}
             </div>
             {lockedByOther ? (
               <Badge variant="outline" className="text-[10px]">
@@ -279,10 +298,11 @@ type ColumnLaneProps = {
   issues: Issue[];
   issueLocks: Record<string, LockInfo>;
   me: UserLite;
+  memberDirectory: Record<string, string>;
   onSelectIssue: (issue: Issue) => void;
 };
 
-function ColumnLane({ status, label, issues, issueLocks, me, onSelectIssue }: ColumnLaneProps) {
+function ColumnLane({ status, label, issues, issueLocks, me, memberDirectory, onSelectIssue }: ColumnLaneProps) {
   const { setNodeRef, isOver } = useDroppable({ id: toColumnDropId(status) });
 
   return (
@@ -306,6 +326,7 @@ function ColumnLane({ status, label, issues, issueLocks, me, onSelectIssue }: Co
                 issue={issue}
                 me={me}
                 lockInfo={issueLocks[issue.id]}
+                memberDirectory={memberDirectory}
                 onSelect={onSelectIssue}
               />
             ))}
@@ -483,6 +504,7 @@ function RealtimeBoard({ supabase, session }: BoardProps) {
   const [issues, setIssues] = useState<Issue[]>([]);
   const [commentsByIssue, setCommentsByIssue] = useState<Record<string, Comment[]>>({});
   const [activities, setActivities] = useState<Activity[]>([]);
+  const [members, setMembers] = useState<ProjectMember[]>([]);
 
   const [presence, setPresence] = useState<Record<string, UserLite>>({});
   const [issueLocks, setIssueLocks] = useState<Record<string, LockInfo>>({});
@@ -507,19 +529,26 @@ function RealtimeBoard({ supabase, session }: BoardProps) {
 
   const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 6 } }));
 
-  const assigneeOptions = useMemo(() => {
-    const values = new Set<string>();
-    for (const issue of issues) {
-      if (issue.assignee_name) values.add(issue.assignee_name);
+  const memberDirectory = useMemo(() => {
+    const map: Record<string, string> = {};
+    for (const member of members) {
+      map[member.user_id] = resolveProfileName(member.profiles, member.user_id);
     }
-    return Array.from(values).sort((a, b) => a.localeCompare(b));
-  }, [issues]);
+    map[me.id] = me.name;
+    return map;
+  }, [me.id, me.name, members]);
+
+  const assigneeOptions = useMemo(() => {
+    return members
+      .map((m) => ({ id: m.user_id, label: resolveProfileName(m.profiles, m.user_id) }))
+      .sort((a, b) => a.label.localeCompare(b.label));
+  }, [members]);
 
   const filteredIssues = useMemo(() => {
     const q = filters.q.trim().toLowerCase();
     return issues.filter((i) => {
       if (filters.priority !== "all" && i.priority !== filters.priority) return false;
-      if (filters.assignee !== "all" && (i.assignee_name || "") !== filters.assignee) return false;
+      if (filters.assignee !== "all" && (i.assignee_id || "") !== filters.assignee) return false;
       if (!q) return true;
       return (
         i.key.toLowerCase().includes(q) ||
@@ -582,28 +611,32 @@ function RealtimeBoard({ supabase, session }: BoardProps) {
   }, []);
 
   const fetchInitialData = useCallback(async () => {
-    const [{ data: issueRows, error: issueErr }, { data: commentRows, error: commentErr }, { data: activityRows, error: activityErr }] =
+    const [{ data: issueRows, error: issueErr }, { data: commentRows, error: commentErr }, { data: activityRows, error: activityErr }, { data: memberRows, error: memberErr }] =
       await Promise.all([
         supabase
           .from("issues")
-          .select("*")
+          .select("*, assignee:assignee_id(id, display_name), reporter:reporter_id(id, display_name)")
           .eq("project_id", PROJECT_ID)
           .order("position", { ascending: true }),
         supabase
           .from("comments")
-          .select("*")
+          .select("*, author:author_id(id, display_name)")
           .eq("project_id", PROJECT_ID)
           .order("created_at", { ascending: true }),
         supabase
           .from("activities")
-          .select("*")
+          .select("*, actor:actor_id(id, display_name)")
           .eq("project_id", PROJECT_ID)
           .order("created_at", { ascending: false })
           .limit(200),
+        supabase
+          .from("project_members")
+          .select("project_id, user_id, role, profiles(id, display_name)")
+          .eq("project_id", PROJECT_ID),
       ]);
 
-    if (issueErr || commentErr || activityErr) {
-      console.error("Initial fetch failed", issueErr || commentErr || activityErr);
+    if (issueErr || commentErr || activityErr || memberErr) {
+      console.error("Initial fetch failed", issueErr || commentErr || activityErr || memberErr);
       return;
     }
 
@@ -617,6 +650,7 @@ function RealtimeBoard({ supabase, session }: BoardProps) {
     setCommentsByIssue(commentMap);
 
     setActivities((activityRows || []) as Activity[]);
+    setMembers((memberRows || []) as ProjectMember[]);
   }, [supabase]);
 
   useEffect(() => {
@@ -743,7 +777,7 @@ function RealtimeBoard({ supabase, session }: BoardProps) {
         id: uid(),
         project_id: PROJECT_ID,
         actor_id: me.id,
-        actor_name: me.name,
+
         action,
         metadata,
         created_at: nowIso(),
@@ -754,7 +788,7 @@ function RealtimeBoard({ supabase, session }: BoardProps) {
       const { error } = await supabase.from("activities").insert(row);
       if (error) console.error("Activity insert failed", error);
     },
-    [me.id, me.name, supabase]
+    [me.id, supabase]
   );
 
   const createIssue = useCallback(async () => {
@@ -770,9 +804,9 @@ function RealtimeBoard({ supabase, session }: BoardProps) {
       status: newIssueStatus,
       priority: newIssuePriority,
       assignee_id: null,
-      assignee_name: null,
+
       reporter_id: me.id,
-      reporter_name: me.name,
+
       story_points: null,
       due_date: null,
       position: grouped[newIssueStatus].length,
@@ -797,7 +831,6 @@ function RealtimeBoard({ supabase, session }: BoardProps) {
     grouped,
     issues,
     me.id,
-    me.name,
     newIssueDesc,
     newIssuePriority,
     newIssueStatus,
@@ -837,7 +870,7 @@ function RealtimeBoard({ supabase, session }: BoardProps) {
       project_id: PROJECT_ID,
       issue_id: selectedIssue.id,
       author_id: me.id,
-      author_name: me.name,
+
       body: draftComment.trim(),
       created_at: nowIso(),
     };
@@ -848,7 +881,7 @@ function RealtimeBoard({ supabase, session }: BoardProps) {
 
     const { error } = await supabase.from("comments").insert(row);
     if (error) console.error("Comment insert failed", error);
-  }, [draftComment, me.id, me.name, persistActivity, selectedIssue, supabase, upsertCommentLocal]);
+  }, [draftComment, me.id, persistActivity, selectedIssue, supabase, upsertCommentLocal]);
 
   const reorderLocally = useCallback(
     (issueId: string, targetStatus: IssueStatus, targetIndex: number) => {
@@ -1116,9 +1149,9 @@ function RealtimeBoard({ supabase, session }: BoardProps) {
                   </SelectTrigger>
                   <SelectContent>
                     <SelectItem value="all">All assignees</SelectItem>
-                    {assigneeOptions.map((a) => (
-                      <SelectItem key={a} value={a}>
-                        {a}
+                    {assigneeOptions.map((option) => (
+                      <SelectItem key={option.id} value={option.id}>
+                        {option.label}
                       </SelectItem>
                     ))}
                   </SelectContent>
@@ -1141,7 +1174,7 @@ function RealtimeBoard({ supabase, session }: BoardProps) {
                       activities.slice(0, 50).map((a) => (
                         <div key={a.id} className="text-sm">
                           <p>
-                            <span className="font-medium">{a.actor_name}</span> {a.action}
+                            <span className="font-medium">{resolveProfileName(a.actor, memberDirectory[a.actor_id])}</span> {a.action}
                           </p>
                           <p className="text-xs text-muted-foreground">{formatDateTime(a.created_at)}</p>
                           <Separator className="mt-2" />
@@ -1165,6 +1198,7 @@ function RealtimeBoard({ supabase, session }: BoardProps) {
                     issues={grouped[s.id]}
                     issueLocks={issueLocks}
                     me={me}
+                    memberDirectory={memberDirectory}
                     onSelectIssue={(issue) => setSelectedIssueId(issue.id)}
                   />
                 ))}
@@ -1260,18 +1294,29 @@ function RealtimeBoard({ supabase, session }: BoardProps) {
                   </Select>
                 </div>
 
-                <Input
-                  placeholder="Assignee"
-                  value={selectedIssue.assignee_name || ""}
-                  disabled={Boolean(selectedLockedByOther)}
-                  onChange={(e) =>
+                <Select
+                  value={selectedIssue.assignee_id || "unassigned"}
+                  onValueChange={(value) =>
                     patchIssue(
                       selectedIssue.id,
-                      { assignee_name: e.target.value || null },
+                      { assignee_id: value === "unassigned" ? null : value },
                       "Changed assignee"
                     )
                   }
-                />
+                  disabled={Boolean(selectedLockedByOther)}
+                >
+                  <SelectTrigger>
+                    <SelectValue placeholder="Assignee" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="unassigned">Unassigned</SelectItem>
+                    {assigneeOptions.map((option) => (
+                      <SelectItem key={option.id} value={option.id}>
+                        {option.label}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
 
                 <Separator />
 
@@ -1282,7 +1327,7 @@ function RealtimeBoard({ supabase, session }: BoardProps) {
                       {(commentsByIssue[selectedIssue.id] || []).map((c) => (
                         <motion.div key={c.id} initial={{ opacity: 0, y: 4 }} animate={{ opacity: 1, y: 0 }}>
                           <div className="text-sm">
-                            <p className="font-medium">{c.author_name}</p>
+                            <p className="font-medium">{resolveProfileName(c.author, memberDirectory[c.author_id])}</p>
                             <p className="text-muted-foreground whitespace-pre-wrap">{c.body}</p>
                             <p className="text-xs text-muted-foreground mt-1">{formatDateTime(c.created_at)}</p>
                           </div>
@@ -1401,20 +1446,40 @@ export default function RealtimeJiraLikeManager() {
  *    - Email/Password
  *    - Google (OAuth)
  *
- * 2) Recommended tables:
+ * 2) Recommended relational schema (ids + profile tables):
+ *
+ * profiles(
+ *   id uuid primary key references auth.users(id) on delete cascade,
+ *   display_name text,
+ *   email text,
+ *   created_at timestamptz not null default now()
+ * );
+ *
+ * projects(
+ *   id text primary key,
+ *   name text not null,
+ *   owner_id uuid not null references profiles(id),
+ *   created_at timestamptz not null default now()
+ * );
+ *
+ * project_members(
+ *   project_id text not null references projects(id) on delete cascade,
+ *   user_id uuid not null references profiles(id) on delete cascade,
+ *   role text not null default 'member', -- owner | manager | member | viewer
+ *   created_at timestamptz not null default now(),
+ *   primary key(project_id, user_id)
+ * );
  *
  * issues(
  *   id text primary key,
- *   project_id text not null,
+ *   project_id text not null references projects(id) on delete cascade,
  *   key text not null,
  *   title text not null,
  *   description text not null default '',
  *   status text not null,
  *   priority text not null,
- *   assignee_id uuid null,
- *   assignee_name text null,
- *   reporter_id uuid not null,
- *   reporter_name text not null,
+ *   assignee_id uuid null references profiles(id),
+ *   reporter_id uuid not null references profiles(id),
  *   story_points int null,
  *   due_date timestamptz null,
  *   position int not null default 0,
@@ -1424,34 +1489,41 @@ export default function RealtimeJiraLikeManager() {
  *
  * comments(
  *   id text primary key,
- *   project_id text not null,
+ *   project_id text not null references projects(id) on delete cascade,
  *   issue_id text not null references issues(id) on delete cascade,
- *   author_id uuid not null,
- *   author_name text not null,
+ *   author_id uuid not null references profiles(id),
  *   body text not null,
  *   created_at timestamptz not null default now()
  * );
  *
  * activities(
  *   id text primary key,
- *   project_id text not null,
- *   actor_id uuid not null,
- *   actor_name text not null,
+ *   project_id text not null references projects(id) on delete cascade,
+ *   actor_id uuid not null references profiles(id),
  *   action text not null,
  *   metadata jsonb,
  *   created_at timestamptz not null default now()
  * );
  *
- * project_members(
- *   project_id text not null,
- *   user_id uuid not null,
- *   role text not null default 'member',
- *   primary key(project_id, user_id)
- * );
+ * 3) Enforce authorization with RLS (critical):
  *
- * 3) Enable RLS and use auth.uid() in policies, e.g.:
- *
+ * alter table profiles enable row level security;
+ * alter table projects enable row level security;
+ * alter table project_members enable row level security;
  * alter table issues enable row level security;
+ * alter table comments enable row level security;
+ * alter table activities enable row level security;
+ *
+ * create policy "projects_select_member"
+ *   on projects for select
+ *   using (
+ *     exists (
+ *       select 1 from project_members pm
+ *       where pm.project_id = projects.id
+ *         and pm.user_id = auth.uid()
+ *     )
+ *   );
+ *
  * create policy "issues_select_member"
  *   on issues for select
  *   using (
@@ -1470,20 +1542,60 @@ export default function RealtimeJiraLikeManager() {
  *       select 1 from project_members pm
  *       where pm.project_id = issues.project_id
  *         and pm.user_id = auth.uid()
+ *         and pm.role in ('owner', 'manager', 'member')
  *     )
  *   );
  *
- * create policy "issues_update_member"
+ * create policy "issues_update_editor_role"
  *   on issues for update
  *   using (
  *     exists (
  *       select 1 from project_members pm
  *       where pm.project_id = issues.project_id
  *         and pm.user_id = auth.uid()
+ *         and pm.role in ('owner', 'manager', 'member')
+ *     )
+ *   )
+ *   with check (
+ *     exists (
+ *       select 1 from project_members pm
+ *       where pm.project_id = issues.project_id
+ *         and pm.user_id = auth.uid()
+ *         and pm.role in ('owner', 'manager', 'member')
  *     )
  *   );
  *
- * Apply equivalent select/insert/update policies for comments and activities.
+ * create policy "issues_delete_admin_roles"
+ *   on issues for delete
+ *   using (
+ *     exists (
+ *       select 1 from project_members pm
+ *       where pm.project_id = issues.project_id
+ *         and pm.user_id = auth.uid()
+ *         and pm.role in ('owner', 'manager')
+ *     )
+ *   );
+ *
+ * create policy "comments_member_rw"
+ *   on comments for all
+ *   using (
+ *     exists (
+ *       select 1 from project_members pm
+ *       where pm.project_id = comments.project_id
+ *         and pm.user_id = auth.uid()
+ *     )
+ *   )
+ *   with check (
+ *     author_id = auth.uid()
+ *     and exists (
+ *       select 1 from project_members pm
+ *       where pm.project_id = comments.project_id
+ *         and pm.user_id = auth.uid()
+ *         and pm.role in ('owner', 'manager', 'member')
+ *     )
+ *   );
+ *
+ * Apply equivalent policies for activities and project_members so only project members can read/write project-scoped rows.
  *
  * 4) Keep realtime enabled on issues/comments/activities tables.
  * 5) (Recommended) Implement move_issue(...) RPC as SECURITY DEFINER for safe concurrent ordering.
