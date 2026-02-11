@@ -709,6 +709,13 @@ function RealtimeBoard({ supabase, session }: BoardProps) {
       .on("broadcast", { event: "issue-lock" }, ({ payload }) => {
         const p = payload as LockPayload;
         setIssueLocks((prev) => {
+          const isKnownMember = members.some((m) => m.user_id === p.userId);
+          const isPresent = Boolean(presence[p.userId]);
+          const isSelf = p.userId === me.id;
+          if (!isKnownMember && !isPresent && !isSelf) {
+            return prev;
+          }
+
           const next = { ...prev };
           if (!p.locked) {
             const existing = next[p.issueId];
@@ -738,7 +745,7 @@ function RealtimeBoard({ supabase, session }: BoardProps) {
       setChannel(null);
       setConnected(false);
     };
-  }, [me, removeIssueLocal, supabase, upsertCommentLocal, upsertIssueLocal]);
+  }, [me, members, presence, removeIssueLocal, supabase, upsertCommentLocal, upsertIssueLocal]);
 
   const sendIssueLock = useCallback(
     (issueId: string, locked: boolean) => {
@@ -1213,7 +1220,7 @@ function RealtimeBoard({ supabase, session }: BoardProps) {
               <CardContent className="text-sm text-muted-foreground space-y-2">
                 <p>• Identity comes from Supabase Auth session.</p>
                 <p>• Presence uses authenticated user ids.</p>
-                <p>• Issue locks are user-id based.</p>
+                <p>• Issue locks are user-id based and ignore unknown broadcasters.</p>
                 <p>• All writes are attributable to actor_id/author_id.</p>
                 <p>• Never trust client-sent identity text as authority.</p>
                 <p>• Use auth.uid() + role checks in RLS policies for authorization.</p>
